@@ -1,0 +1,15 @@
+MOSS-LLLite
+
+This project adapts Anima LLLite conditioning to ComfyUI's MOSS-Image model.
+It imports AnimaLLLiteConditioning and AnimaLLLiteModule from ComfyUI and adapts
+the native MOSS image-generation block for attention-input control.
+
+Upstream project: ComfyUI
+https://github.com/Comfy-Org/ComfyUI
+Anima LLLite: comfy/ldm/anima/lllite.py
+MOSS-Image: comfy/ldm/moss_image/model.py
+Upstream license: GNU General Public License, version 3.
+Upstream copyright notices and licenses remain applicable.
+
+This repository contains inference code only. Model weights are distributed
+separately and are subject to their own applicable licenses.

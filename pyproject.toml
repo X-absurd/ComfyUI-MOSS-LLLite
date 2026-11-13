@@ -1,0 +1,11 @@
+[project]
+name = "comfyui-moss-lllite"
+version = "0.1.0"
+description = "Anima-style LLLite Tile control for MOSS-Image in ComfyUI"
+readme = "README.md"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/X-absurd/ComfyUI-MOSS-LLLite"
+Issues = "https://github.com/X-absurd/ComfyUI-MOSS-LLLite/issues"
