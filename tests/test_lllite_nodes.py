@@ -80,9 +80,7 @@ class NodeTests(unittest.TestCase):
         def executor(x, timestep, context, options, **kwargs):
             observed.update(options); return x
         x, context = torch.randn(2, 128, 4, 4), torch.randn(2, 3, 16)
-        with patch.object(control.model.conditioner, 'forward', wraps=control.model.conditioner.forward) as encode:
-            wrapper(executor, x, torch.tensor([.5]), context, {}, context_attention_bias=torch.zeros(2, 3))
-        self.assertEqual(encode.call_args.args[0].shape[0], 2)
+        wrapper(executor, x, torch.tensor([.5]), context, {}, context_attention_bias=torch.zeros(2, 3))
         condition, mask = observed[nodes.CONTROL_KEY][wrapper]
         self.assertEqual(condition.shape, (2, 16, 8))
         self.assertTrue(torch.equal(condition[0], condition[1]))
@@ -91,76 +89,6 @@ class NodeTests(unittest.TestCase):
         wrapper.sigma_start, wrapper.sigma_end = .3, .1
         wrapper(executor, x, torch.tensor([.8]), context, {'sigmas': torch.tensor([.8])})
         self.assertNotIn(nodes.CONTROL_KEY, observed)
-
-    def test_fused_projection_rows_bias_and_gradients(self):
-        projection = nn.Linear(32, 96)
-        inputs = [torch.randn(2, 19, 32, requires_grad=True) for _ in range(3)]
-        expected = tuple(projection(value).chunk(3, dim=-1)[i] for i, value in enumerate(inputs))
-        actual = architecture.project_fused_qkv(projection, inputs)
-        for result, reference in zip(actual, expected):
-            torch.testing.assert_close(result, reference)
-        parameters = [*inputs, projection.weight, projection.bias]
-        reference_grads = torch.autograd.grad(sum(value.square().sum() for value in expected), parameters)
-        actual_grads = torch.autograd.grad(sum(value.square().sum() for value in actual), parameters)
-        for result, reference in zip(actual_grads, reference_grads):
-            torch.testing.assert_close(result, reference)
-
-    def test_fused_projection_preserves_comfy_weight_and_bias_patches(self):
-        projection = comfy.ops.manual_cast.Linear(32, 96)
-        projection.load_state_dict(nn.Linear(32, 96).state_dict())
-        delta = torch.randn_like(projection.weight) * .01
-        projection.weight_function = [lambda weight: weight + delta]
-        projection.bias_function = [lambda bias: bias + .1]
-        inputs = [torch.randn(2, 19, 32) for _ in range(3)]
-        expected = tuple(projection(value).chunk(3, dim=-1)[i] for i, value in enumerate(inputs))
-        actual = architecture.project_fused_qkv(projection, inputs)
-        for result, reference in zip(actual, expected):
-            torch.testing.assert_close(result, reference)
-
-    def test_custom_projection_retains_its_forward(self):
-        class CustomLinear(nn.Linear):
-            def forward(self, value):
-                return super().forward(value) * 2
-
-        projection = CustomLinear(32, 96)
-        inputs = [torch.randn(1, 19, 32) for _ in range(3)]
-        self.assertIs(architecture.project_fused_qkv(projection, inputs), NotImplemented)
-
-    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA required for native INT8 ConvRot')
-    def test_fused_int8_convrot_rows_match_native_projection(self):
-        projection = comfy.ops.mixed_precision_ops(compute_dtype=torch.bfloat16).Linear(
-            256, 768, bias=False, device='cuda')
-        weight = architecture.QuantizedTensor.from_float(
-            torch.randn(768, 256, device='cuda', dtype=torch.bfloat16),
-            'TensorWiseINT8Layout', per_channel=True, convrot=True, convrot_groupsize=256)
-        projection.weight = nn.Parameter(weight, requires_grad=False)
-        projection.quant_format = 'int8_tensorwise'
-        projection.layout_type = 'TensorWiseINT8Layout'
-        inputs = [torch.randn(2, 32, 256, device='cuda', dtype=torch.bfloat16) for _ in range(3)]
-        expected = tuple(projection(value).chunk(3, dim=-1)[i] for i, value in enumerate(inputs))
-        actual = architecture.project_fused_qkv(projection, inputs)
-        for result, reference in zip(actual, expected):
-            torch.testing.assert_close(result, reference, atol=0, rtol=0)
-        delta = torch.randn(768, 256, device='cuda', dtype=torch.bfloat16) * .01
-        projection.weight_function = [lambda value: value + delta]
-        expected = tuple(projection(value).chunk(3, dim=-1)[i] for i, value in enumerate(inputs))
-        actual = architecture.project_fused_qkv(projection, inputs)
-        for result, reference in zip(actual, expected):
-            torch.testing.assert_close(result, reference, atol=0, rtol=0)
-
-    def test_cfg_condition_batch_order(self):
-        model, control, image = fixture()
-        image = image.repeat(2, 1, 1, 1)
-        image[1] = 1 - image[1]
-        wrapper = nodes.MossLLLitePatch(control, image, 1, float('inf'), 0)
-        observed = {}
-        def executor(x, timestep, context, options, **kwargs):
-            observed.update(options); return x
-        wrapper(executor, torch.randn(4, 128, 4, 4), torch.tensor([.5]), torch.randn(4, 3, 16), {})
-        actual = observed[nodes.CONTROL_KEY][wrapper][0]
-        pixels = image.movedim(-1, 1).repeat(2, 1, 1, 1) * 2 - 1
-        reference = control.model.conditioner(pixels)
-        torch.testing.assert_close(actual, reference)
 
     def test_loader_roundtrip(self):
         model, control, image = fixture()

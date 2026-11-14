@@ -4,15 +4,10 @@ Reuses the upstream ComfyUI Anima LLLite modules without changing their math.
 https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/ldm/anima/lllite.py
 """
 
-from contextlib import nullcontext
-from dataclasses import replace
-
 import torch
 from torch import nn
-import torch.nn.functional as F
 import comfy.ops
 import comfy.ldm.moss_image.model as moss
-from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
 
 from comfy.ldm.anima.lllite import AnimaLLLiteConditioning, AnimaLLLiteModule
 
@@ -62,48 +57,11 @@ def apply_image_control(module, tokens, condition, strength):
     return torch.cat((image, tokens[:, count:]), dim=1)
 
 
-def project_fused_qkv(projection, inputs):
-    if isinstance(projection, comfy.ops.MixedPrecisionOp):
-        if (projection.quant_format not in (None, 'int8_tensorwise') or projection._full_precision_mm
-                or getattr(projection, 'pre_quant_scale', None) is not None):
-            return NotImplemented
-    elif type(projection) not in (nn.Linear, comfy.ops.disable_weight_init.Linear, comfy.ops.manual_cast.Linear):
-        return NotImplemented
-    if isinstance(projection, comfy.ops.CastWeightBiasOp) and projection.comfy_force_forward:
-        return NotImplemented
-
-    comfy.ops.run_every_op()
-    context = (comfy.ops.CastBiasWeightContext(projection, inputs[0], offloadable=True,
-                                              compute_dtype=inputs[0].dtype, want_requant=True)
-               if isinstance(projection, comfy.ops.CastWeightBiasOp)
-               else nullcontext((projection.weight, projection.bias)))
-    with context as (weight, bias):
-        width = weight.shape[0] // 3
-        outputs = []
-        for index, value in enumerate(inputs):
-            start, end = index * width, (index + 1) * width
-            if isinstance(weight, QuantizedTensor):
-                params = weight.params
-                if not isinstance(params, TensorWiseINT8Layout.Params) or params.transposed:
-                    return NotImplemented
-                # Like ComfyUI's MoE bank rows: preserve per-output scales and ConvRot metadata.
-                scale = params.scale if params.scale.numel() == 1 else params.scale[start:end]
-                rows = QuantizedTensor(weight._qdata[start:end], weight._layout_cls,
-                                       replace(params, orig_shape=(width, weight.shape[1]), scale=scale))
-            else:
-                rows = weight[start:end]
-            outputs.append(F.linear(value, rows, None if bias is None else bias[start:end]))
-        return tuple(outputs)
-
-
 def project_qkv(projections, fused, tokens, modules, condition, strength=1.0):
     # Same pre-projection location as Anima/Cosmos compute_qkv's attn1_patch.
     inputs = [apply_image_control(modules[target], tokens, condition, strength) for target in TARGETS]
     if fused:
-        output = project_fused_qkv(projections['qkv'], inputs)
-        if output is not NotImplemented:
-            return output
-        # Other quantization formats retain their module-owned input processing.
+        # Preserve the native op/quantization dispatch for repacked fused checkpoints.
         return tuple(projections['qkv'](value).chunk(3, dim=-1)[index].clone()
                      for index, value in enumerate(inputs))
     return tuple(projections[target](value) for target, value in zip(TARGETS, inputs))

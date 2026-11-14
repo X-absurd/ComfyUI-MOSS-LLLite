@@ -48,9 +48,8 @@ ModelPatcher, additional-model loading, and block replacement interfaces.
 - MOSS-LLLite checkpoints are distinct from Anima LLLite, beta2 concat Tile
   LoRAs, and beta3 residual Tile checkpoints. They are not interchangeable.
 - Remove beta2 concat Tile LoRAs before applying MOSS-LLLite.
-- Fused BF16 and INT8/ConvRot QKV weights use only the rows needed by each
-  controlled projection, while retaining ComfyUI weight casting and patches.
-  Other quantization formats retain the original full-projection path.
+- Fused QKV backbones are supported through native projection calls, with
+  additional compute cost.
 - Color preservation is experimental. Sampling can still change colors; an
   optional Color Match step can help correct the result.
 

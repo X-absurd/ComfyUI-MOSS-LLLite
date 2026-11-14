@@ -59,7 +59,6 @@ class MossLLLitePatch:
             raise ValueError('MOSS LLLite currently supports image generation, without MOSS-Edit reference tokens')
         image = comfy.utils.common_upscale(self.image.movedim(-1, 1), x.shape[-1] * 16, x.shape[-2] * 16,
                                           'bicubic', 'center').clamp(0, 1)
-        # Preserve encoder batch shape: BF16 convolution rounding depends on it.
         image = comfy.utils.repeat_to_batch_size(image.to(device=x.device, dtype=x.dtype), x.shape[0])
         condition = self.control.model.conditioner(image * 2 - 1)
         mask = kwargs.get('context_attention_bias')
