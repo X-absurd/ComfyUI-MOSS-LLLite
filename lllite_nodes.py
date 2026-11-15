@@ -24,7 +24,7 @@ class MossLLLiteLoader(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id='MossLLLiteLoader', display_name='Load MOSS-LLLite Tile', category='MOSS-LLLite',
+            node_id='MossLLLiteLoader', display_name='Load MOSS-LLLite', category='MOSS-LLLite',
             inputs=[io.Combo.Input('name', options=folder_paths.get_filename_list('model_patches'))],
             outputs=[LLLiteType.Output()],
         )
@@ -102,7 +102,7 @@ class MossLLLiteApply(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id='MossLLLiteApply', display_name='Apply MOSS-LLLite Tile', category='MOSS-LLLite',
+            node_id='MossLLLiteApply', display_name='Apply MOSS-LLLite', category='MOSS-LLLite',
             description='Anima-style RGB LLLite adapted to MOSS. Strength 0 returns the input model unchanged.',
             inputs=[io.Model.Input('model'), LLLiteType.Input('control'), io.Image.Input('image'),
                     io.Float.Input('strength', default=1.0, min=0.0, max=10.0, step=0.01),

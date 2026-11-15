@@ -1,6 +1,6 @@
 # MOSS-LLLite
 
-Tile control for MOSS-Image in ComfyUI, adapting Anima LLLite's RGB conditioning
+LLLite control for MOSS-Image in ComfyUI, adapting Anima LLLite's RGB conditioning
 and attention input adapters to MOSS. Control strength is adjustable throughout
 sampling. At strength **0**, the apply node returns the original input model
 without encoding the control image or adding patches.
@@ -22,14 +22,23 @@ Existing workflow node IDs are preserved.
 
 ## Usage
 
-1. Put a **MOSS-LLLite Tile** `.safetensors` checkpoint in
+For Tile restoration, the recommended final release is **V1**, the final design
+developed through four iterations. Use **Load MOSS-LLLite** and **Apply MOSS-LLLite** for these
+weights. V1 refines details while preserving subject features, with good color
+retention in the author's visual tests; exact color matching is not guaranteed.
+
+1. Put a **MOSS-LLLite** `.safetensors` checkpoint in
    `ComfyUI/models/model_patches/`. Model weights are provided separately.
-2. Add **Load MOSS-LLLite Tile** and **Apply MOSS-LLLite Tile**, under the
+2. Add **Load MOSS-LLLite** and **Apply MOSS-LLLite**, under the
    **MOSS-LLLite** category.
 3. Connect the MOSS `MODEL`, loaded controller, and control `IMAGE` to the apply
    node. Connect its output `MODEL` to your sampler.
 4. Keep your normal text conditioning and VAE connections. The apply node takes
    RGB pixels directly and has **no VAE input**.
+
+The control task depends on how the checkpoint was trained. Tile checkpoints
+support image restoration; other tasks require matching MOSS-LLLite checkpoints
+and control images. Renaming the nodes does not add new tasks to existing weights.
 
 Start with strength `0.5`–`1.0`. Higher values usually preserve more of the control
 image's structure. `start_percent` and `end_percent` select the portion of
