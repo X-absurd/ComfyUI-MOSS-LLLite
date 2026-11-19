@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-moss-lllite"
-version = "0.1.2"
+version = "0.1.3"
 description = "Anima-style LLLite control for MOSS-Image in ComfyUI"
 readme = "README.md"
 license = { file = "LICENSE" }

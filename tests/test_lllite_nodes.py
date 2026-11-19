@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -12,10 +13,12 @@ comfy.cli_args.args.cpu = True
 import comfy.model_management
 import comfy.model_patcher
 import comfy.model_sampling
+import comfy.latent_formats
 import comfy.ldm.moss_image.model as moss
 import comfy.ops
 import safetensors.torch
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 PACKAGE = Path(__file__).resolve().parents[1]
@@ -25,6 +28,7 @@ sys.modules[spec.name] = package
 spec.loader.exec_module(package)
 nodes = sys.modules[spec.name + '.lllite_nodes']
 architecture = sys.modules[spec.name + '.lllite_model']
+color_guide = sys.modules[spec.name + '.color_guide']
 
 
 def fixture(fused=False):
@@ -44,6 +48,20 @@ def fixture(fused=False):
     return model, holder, torch.rand(1, 64, 64, 3)
 
 
+class LinearColorVAE:
+    latent_channels = 128
+    def __init__(self):
+        self.inputs = []
+    def encode(self, pixels):
+        self.inputs.append(pixels.clone())
+        channels = F.pad(pixels.mean((1, 2)), (0, 29))
+        return channels.repeat_interleave(4, dim=1)[:, :, None, None].expand(-1, -1, 16, 16)
+    def decode(self, samples):
+        b, _, h, w = samples.shape
+        colors = samples.reshape(b, 32, 4, h, w).mean(2)[:, :3]
+        return F.interpolate(colors, scale_factor=16, mode='nearest').movedim(1, -1)
+
+
 class NodeTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(21)
@@ -53,6 +71,112 @@ class NodeTests(unittest.TestCase):
         model, control, image = fixture()
         self.assertIs(nodes.MossLLLiteApply.execute(model, control, image, 0).result[0], model)
         self.assertIs(nodes.MossLLLiteApply.execute(model, control, image, 1, .8, .2).result[0], model)
+
+    def test_reference_anchor_zero_returns_original_without_adding_hooks(self):
+        model, _, _ = fixture()
+        before = model.model_options.copy()
+        self.assertIs(nodes.MossReferenceAnchorApply.execute(model, {}, 0).result[0], model)
+        self.assertIs(nodes.MossReferenceAnchorApply.execute(model, {}).result[0], model)
+        self.assertEqual(model.model_options, before)
+
+    def test_reference_anchor_corrects_constant_bias_and_preserves_fine_variation(self):
+        reference = torch.zeros(1, 128, 16, 24)
+        checkerboard = ((torch.arange(16)[:, None] + torch.arange(24)[None, :]) % 2).float() * 2 - 1
+        detail = checkerboard[None, None].expand(2, 128, -1, -1) * .1
+        bias = torch.linspace(-.5, .5, 128)[None, :, None, None]
+        anchor = nodes.MossReferenceAnchor(reference, 1, 4)
+        result = anchor({'denoised': detail + bias})
+        torch.testing.assert_close(result, detail, atol=1e-7, rtol=1e-6)
+        zero = nodes.MossReferenceAnchor(reference, 0, 4)
+        self.assertIs(zero({'denoised': detail}), detail)
+
+    def test_reference_anchor_clones_model_reference_and_preserves_existing_hooks(self):
+        model, _, _ = fixture()
+        model.model.latent_format = comfy.latent_formats.Flux2()
+        previous = lambda args: args['denoised']
+        model.set_model_sampler_post_cfg_function(previous)
+        reference = torch.randn(1, 128, 16, 24)
+        saved = reference.clone()
+        result = nodes.MossReferenceAnchorApply.execute(model, {'samples': reference}, .5, 4).result[0]
+        self.assertIsNot(result, model)
+        self.assertEqual(len(model.model_options['sampler_post_cfg_function']), 1)
+        hooks = result.model_options['sampler_post_cfg_function']
+        self.assertEqual(len(hooks), 2)
+        self.assertIs(hooks[0], previous)
+        reference.fill_(100)
+        self.assertTrue(torch.equal(hooks[-1].reference, saved))
+        self.assertEqual(hooks[-1].reference.device.type, 'cpu')
+
+    def test_reference_anchor_rejects_incompatible_latents_and_sampling_shapes(self):
+        model, _, _ = fixture()
+        model.model.latent_format = comfy.latent_formats.Flux2()
+        with self.assertRaisesRegex(ValueError, '128-channel'):
+            nodes.MossReferenceAnchorApply.execute(model, {'samples': torch.zeros(1, 16, 8, 8)}, .5)
+        anchor = nodes.MossReferenceAnchor(torch.zeros(2, 128, 8, 8), .5, 4)
+        with self.assertRaisesRegex(ValueError, 'sampling resolution'):
+            anchor({'denoised': torch.zeros(2, 128, 8, 12)})
+        with self.assertRaisesRegex(ValueError, 'per output image'):
+            anchor({'denoised': torch.zeros(3, 128, 8, 8)})
+
+    def test_color_guide_zero_skips_calibration_and_keeps_input_model(self):
+        model, _, _ = fixture()
+        self.assertIs(color_guide.MossColorGuideApply.execute(model).result[0], model)
+        with self.assertRaisesRegex(ValueError, 'Connect a reference image'):
+            color_guide.MossColorGuideApply.execute(model, strength=.5)
+
+    def test_color_feedback_corrects_palette_and_preserves_other_latent_features(self):
+        vae = LinearColorVAE()
+        image = torch.full((1, 64, 64, 3), .5)
+        directions = color_guide.calibrate_color_directions(vae, image)
+        samples = torch.full((2, 32, 4, 4, 4), .2)
+        samples[:, 3:] = .7
+        samples += torch.tensor([-.03, .03, -.03, .03])[None, None, :, None, None]
+        samples = samples.flatten(1, 2)
+        guide = color_guide.MossColorGuide(vae, image, directions, 1, 4, 2)
+        result = guide(lambda: samples)
+        actual = result.reshape(2, 32, 4, 4, 4)
+        torch.testing.assert_close(actual[:, :3].mean(2), torch.full((2, 3, 4, 4), .5), atol=.03, rtol=0)
+        self.assertTrue(torch.equal(result[:, 12:], samples[:, 12:]))
+        torch.testing.assert_close(actual[:, :, 0] - actual[:, :, 1], torch.full((2, 32, 4, 4), -.06), atol=1e-7, rtol=1e-6)
+        weak = color_guide.MossColorGuide(vae, image, directions, .5, 4, 2).correct(samples)
+        self.assertLess(float(weak[:, :12].mean()), float(result[:, :12].mean()))
+        self.assertGreater(float(weak[:, :12].mean()), float(samples[:, :12].mean()))
+        zero = color_guide.MossColorGuide(None, image, directions, 0, 4, 2)
+        self.assertIs(zero.correct(samples), samples)
+
+    def test_color_guide_calibrates_per_image_and_keeps_existing_hooks(self):
+        model, _, _ = fixture()
+        previous = lambda args: args['denoised']
+        model.set_model_sampler_post_cfg_function(previous)
+        vae = LinearColorVAE()
+        image = torch.full((2, 64, 64, 3), .5)
+        result = color_guide.MossColorGuideApply.execute(model, image, vae, .5, 2).result[0]
+        self.assertIsNot(result, model)
+        self.assertEqual(model.model_options['sampler_post_cfg_function'], [previous])
+        self.assertEqual(result.model_options['sampler_post_cfg_function'], [previous])
+        kind = nodes.comfy.patcher_extension.WrappersMP.OUTER_SAMPLE
+        self.assertFalse(model.get_all_wrappers(kind))
+        wrapper, = result.get_all_wrappers(kind)
+        image.fill_(100)
+        torch.testing.assert_close(wrapper.target, torch.full((2, 3, 2, 2), .5))
+        self.assertEqual(wrapper.directions.device.type, 'cpu')
+        torch.testing.assert_close(wrapper.directions.norm(dim=-2), torch.ones(2, 3))
+        self.assertEqual(len(vae.inputs), 6)
+        weights = torch.tensor([.2126, .7152, .0722])
+        for pixels in vae.inputs[:4]:
+            self.assertEqual(pixels.shape, (2, 256, 256, 3))
+            torch.testing.assert_close(pixels @ weights, torch.full((2, 256, 256), .5))
+
+    def test_color_guide_rejects_misaligned_images_and_sampling_shapes(self):
+        model, _, _ = fixture()
+        vae = SimpleNamespace(latent_channels=128)
+        with self.assertRaisesRegex(ValueError, 'multiples of 16'):
+            color_guide.MossColorGuideApply.execute(model, torch.zeros(1, 65, 64, 3), vae, .5)
+        guide = color_guide.MossColorGuide(None, torch.zeros(2, 64, 64, 3), torch.zeros(2, 32, 3), .5, 4, 2)
+        with self.assertRaisesRegex(ValueError, 'sampling resolution'):
+            guide.correct(torch.zeros(2, 128, 4, 6))
+        with self.assertRaisesRegex(ValueError, 'per output image'):
+            guide.correct(torch.zeros(3, 128, 4, 4))
 
     def test_real_block_matches_original_at_zero_and_changes_at_nonzero(self):
         # Native CPU attention and differentiable norm path, without kitchen CUDA kernels.
@@ -91,6 +215,53 @@ class NodeTests(unittest.TestCase):
         wrapper.sigma_start, wrapper.sigma_end = .3, .1
         wrapper(executor, x, torch.tensor([.8]), context, {'sigmas': torch.tensor([.8])})
         self.assertNotIn(nodes.CONTROL_KEY, observed)
+
+    def test_rgb_normalization_matches_training_before_bfloat16_cast(self):
+        model, control, _ = fixture()
+        image = torch.arange(256, dtype=torch.float32).view(1, 1, 256, 1).expand(1, 256, 256, 3) / 255
+        patcher = nodes.MossLLLiteApply.execute(model, control, image).result[0]
+        wrapper = patcher.get_all_wrappers(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL)[0]
+        x = torch.zeros(2, 128, 16, 16, dtype=torch.bfloat16)
+        with patch.object(control.model.conditioner, 'forward', return_value=torch.zeros(2, 256, 8)) as encode:
+            wrapper(lambda *args, **kwargs: x, x, torch.tensor([.5]), None, {})
+        expected = (image.movedim(-1, 1) * 2 - 1).to(torch.bfloat16).repeat(2, 1, 1, 1)
+        self.assertTrue(torch.equal(encode.call_args.args[0], expected))
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA required for trainer AMP parity')
+    def test_cuda_conditioning_and_adapter_match_training_arithmetic(self):
+        _, holder, _ = fixture()
+        training = holder.model.to(device='cuda', dtype=torch.bfloat16)
+        control = architecture.MossLLLiteControl(
+            **training.config, operations=comfy.ops.manual_cast, device='cuda', dtype=torch.bfloat16)
+        control.load_state_dict(training.state_dict())
+        holder = comfy.model_patcher.ModelPatcher(control, load_device=torch.device('cuda'),
+                                                 offload_device=torch.device('cpu'))
+        image = torch.rand(1, 64, 96, 3)
+        wrapper = nodes.MossLLLitePatch(holder, image, 1, float('inf'), 0)
+        observed = {}
+
+        def executor(x, timestep, context, options, **kwargs):
+            self.assertFalse(torch.is_autocast_enabled('cuda'))
+            observed.update(options)
+            return x
+
+        x = torch.randn(2, 128, 4, 6, device='cuda', dtype=torch.bfloat16)
+        wrapper(executor, x, torch.tensor([.5], device='cuda'), None, {})
+        actual = observed[nodes.CONTROL_KEY][wrapper][0]
+        pixels = (image.movedim(-1, 1) * 2 - 1).cuda().repeat(2, 1, 1, 1)
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            expected = training.conditioner(pixels)
+        self.assertEqual(actual.dtype, torch.float32)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        tokens = torch.randn(2, 27, 32, device='cuda', dtype=torch.bfloat16)
+        for target in architecture.TARGETS:
+            with torch.autocast('cuda', dtype=torch.bfloat16):
+                image_tokens = training.blocks[0][target](tokens[:, :24], expected, .25)
+            reference = torch.cat((image_tokens, tokens[:, 24:]), dim=1)
+            result = architecture.apply_image_control(control.blocks[0][target], tokens, actual, .25)
+            torch.testing.assert_close(result, reference, atol=0, rtol=0)
+            self.assertTrue(torch.equal(result[:, 24:], tokens[:, 24:]))
+        self.assertFalse(torch.is_autocast_enabled('cuda'))
 
     def test_fused_projection_rows_bias_and_gradients(self):
         projection = nn.Linear(32, 96)

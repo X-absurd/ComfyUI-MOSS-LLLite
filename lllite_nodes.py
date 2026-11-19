@@ -14,7 +14,7 @@ import comfy.patcher_extension
 import comfy.utils
 from comfy_api.latest import io
 
-from .lllite_model import MossLLLiteControl, PREFIX, config_from_metadata, controlled_moss_block
+from .lllite_model import MossLLLiteControl, PREFIX, config_from_metadata, control_autocast, controlled_moss_block
 
 LLLiteType = io.Custom('MOSS_LLLITE_CONTROL')
 CONTROL_KEY = 'moss_lllite'
@@ -59,9 +59,12 @@ class MossLLLitePatch:
             raise ValueError('MOSS LLLite currently supports image generation, without MOSS-Edit reference tokens')
         image = comfy.utils.common_upscale(self.image.movedim(-1, 1), x.shape[-1] * 16, x.shape[-2] * 16,
                                           'bicubic', 'center').clamp(0, 1)
+        amp = x.device.type == 'cuda' and x.dtype in (torch.float16, torch.bfloat16)
+        image = (image.float() * 2 - 1).to(device=x.device, dtype=torch.float32 if amp else x.dtype)
         # Preserve encoder batch shape: BF16 convolution rounding depends on it.
-        image = comfy.utils.repeat_to_batch_size(image.to(device=x.device, dtype=x.dtype), x.shape[0])
-        condition = self.control.model.conditioner(image * 2 - 1)
+        image = comfy.utils.repeat_to_batch_size(image, x.shape[0])
+        with control_autocast(x):
+            condition = self.control.model.conditioner(image)
         mask = kwargs.get('context_attention_bias')
         if mask is not None:
             mask = F.pad(mask, (x.shape[-2] * x.shape[-1], 0))[:, None, None]
@@ -134,4 +137,57 @@ class MossLLLiteApply(io.ComfyNode):
             result.set_model_patch_replace(MossLLLiteBlockPatch(patch, index, block, existing.get(('single_block', index))),
                                            'dit', 'single_block', index)
         result.set_additional_models(CONTROL_KEY, result.get_additional_models_with_key(CONTROL_KEY) + [control])
+        return io.NodeOutput(result)
+
+
+class MossReferenceAnchor:
+    def __init__(self, reference, strength, grid_size):
+        self.reference = reference.to(device='cpu').clone()
+        self.strength, self.grid_size = strength, grid_size
+
+    def __call__(self, args):
+        denoised = args['denoised']
+        if self.strength == 0:
+            return denoised
+        if denoised.shape[1:] != self.reference.shape[1:]:
+            raise ValueError('MOSS reference anchor needs a reference latent at the sampling resolution')
+        if self.reference.shape[0] not in (1, denoised.shape[0]):
+            raise ValueError('MOSS reference anchor needs one reference image or one per output image')
+        target = self.reference.to(device=denoised.device, dtype=denoised.dtype)
+        grid = (min(self.grid_size, denoised.shape[-2]), min(self.grid_size, denoised.shape[-1]))
+        difference = F.adaptive_avg_pool2d(target - denoised, grid)
+        difference = F.interpolate(difference, size=denoised.shape[-2:], mode='bilinear', align_corners=False)
+        return denoised + difference * self.strength
+
+
+class MossReferenceAnchorApply(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id='MossReferenceAnchorApply', display_name='Apply MOSS Reference Anchor', category='MOSS-LLLite',
+            description='Experimental sampling constraint for reference colors and coarse structure. '
+                        'Can strongly suppress generated texture and sharpening; disabled by default. '
+                        'Encode the control image with the Flux2 VAE at the sampling resolution. '
+                        'This is independent of LLLite strength; disable both controls to keep the input model unchanged.',
+            inputs=[io.Model.Input('model'), io.Latent.Input('reference'),
+                    io.Float.Input('strength', default=0.0, min=0.0, max=1.0, step=0.05),
+                    io.Int.Input('grid_size', default=8, min=1, max=32, step=1, advanced=True,
+                                 tooltip='More cells preserve finer reference structure as well as color.')],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, reference, strength=0.0, grid_size=8):
+        if strength == 0:
+            return io.NodeOutput(model)
+        if not 0 < strength <= 1 or grid_size < 1:
+            raise ValueError('MOSS reference anchor needs strength in (0, 1] and a positive grid size')
+        if not isinstance(model.get_model_object('diffusion_model'), comfy.ldm.moss_image.model.MOSSImage):
+            raise ValueError('MOSS reference anchor requires a MOSS-Image backbone')
+        samples = reference['samples']
+        if samples.ndim != 4 or samples.shape[1] != 128:
+            raise ValueError('MOSS reference anchor requires a 128-channel Flux2 image latent')
+        samples = model.get_model_object('latent_format').process_in(samples)
+        result = model.clone()
+        result.set_model_sampler_post_cfg_function(MossReferenceAnchor(samples, strength, grid_size))
         return io.NodeOutput(result)

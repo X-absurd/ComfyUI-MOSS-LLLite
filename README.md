@@ -49,6 +49,89 @@ this controller's strength is zero.
 The controller does not merge weights into the backbone. It uses ComfyUI's
 ModelPatcher, additional-model loading, and block replacement interfaces.
 
+## Experimental color guide
+
+**Update recommended if preserving reference colors matters to your workflow.**
+Existing MOSS-LLLite weights remain compatible; no model download is needed.
+For a Git installation, run `git pull` in `custom_nodes/ComfyUI-MOSS-LLLite`,
+then restart ComfyUI and refresh the browser. For a manual installation, replace
+the node folder with the latest package before restarting.
+
+**Apply MOSS Color Guide** corrects the final sampled latent using the colors
+actually decoded by the supplied Flux2 VAE. It measures coarse RGB errors,
+probes three calibrated color directions, and updates only those directions.
+Local comparisons preserve generated texture substantially better than the
+full-channel Reference Anchor. Brightness, contrast and some detail can still
+change; exact RGB preservation is not guaranteed. This is inference color
+compensation, not a repaired or retrained LLLite checkpoint. Texture can remain
+visibly intact while reduced local contrast makes the image look slightly less
+sharp. Compare both the overall image and native-size detail crops.
+
+1. Resize the reference to the sampling resolution, in multiples of 16.
+2. Connect this image to `image`, and **flux2-vae** to `vae`.
+3. Connect **Apply MOSS-LLLite** to the guide's `model`, then the guide to the
+   sampler. Keep **Reference Anchor** disabled. Try strength `1`, grid `8`,
+   iterations `2`; reduce strength for a partial color correction.
+4. Decode with the same VAE using ordinary **VAE Decode**. Tiled decoding can
+   introduce separate drift after correction.
+
+| Parameter | Meaning | Starting point |
+| --- | --- | --- |
+| `strength` | Amount of color correction, independent of LLLite strength; `0` disables it | `1.0` for stronger color retention; try `0.8` if the result looks softer |
+| `iterations` | Number of decoder-feedback correction rounds; more rounds cost more time | `2`; try `3` only for remaining color error |
+| `grid_size` | Coarse color measurement grid, normally `grid_size × grid_size`; not image tiles | `8`; try `16` for local color shifts or small subjects on large canvases |
+
+The guide is disabled by default. Strength `0` returns its input model
+unchanged and skips calibration. Its strength is independent of LLLite: both
+must be disabled to remove both reference constraints. Higher strength is not
+always better. For small subjects on large canvases, inspect local color and
+try grid `16`; a full-frame average can hide a local failure.
+
+This costs additional time: calibration uses six small VAE encodes, followed
+by `1 + 4 × iterations` full VAE decodes after sampling. In local private tests,
+two iterations added about 3 seconds at 1.5 MP and 38 seconds at 9.5 MP; timings
+depend on hardware, decoder settings and offloading. Increase to three iterations
+only if the remaining color shift justifies the cost.
+
+No additional weights are required. RGB is used to measure error; the correction
+changes the latent, not the final decoded RGB pixels. For tiled sampling, use
+the current tile image, not a full-frame reference to a smaller tile sampler.
+
+## Experimental reference anchor
+
+**Apply MOSS Reference Anchor** adds an explicit reference constraint during
+denoising. It constrains low-frequency latent features, including colors and
+coarse structure. It can strongly suppress newly generated texture and make
+an upscaled image look as soft as its reference. It is disabled by default
+and is **not recommended for detail enhancement**. This is a sampling
+constraint, not an RGB Color Match operation or a newly trained LLLite model.
+Existing MOSS Tile checkpoints can be used with it.
+
+1. Resize the reference image to the final sampling resolution and encode it
+   with the **Flux2 VAE** using **VAE Encode**.
+2. Connect that `LATENT` to the anchor's `reference` input and the sampler's
+   `latent_image` input. Their spatial dimensions must match.
+3. Connect the model after **Apply MOSS-LLLite** to the anchor, then connect the
+   anchor's output model to the sampler. Strength `0` leaves the input model
+   unchanged. Enable it only if keeping the reference matters more than new detail.
+4. Decode with ordinary **VAE Decode** when memory permits. Tiled VAE decoding
+   can introduce a separate color difference after sampling.
+
+Higher anchor strength keeps the reference more closely. A larger grid also
+preserves finer reference structure, reducing freedom to redraw it. The anchor
+is independent of LLLite strength: disable both to remove both constraints.
+At anchor strength `0`, this node returns its input model unchanged.
+
+For a small subject inside a large, multi-megapixel canvas, try grid size `16`
+or `32`. A coarse grid can improve the background while missing a local color
+shift. Larger grids do not resolve the texture tradeoff. Inspect native-size
+texture crops as well as the overall image; color error and SSIM alone cannot
+measure detail enhancement.
+
+Strong style LoRAs can reduce color following even when the Tile controller
+holds geometry well. For restoration, compare a model without the style LoRA
+in the refinement stage; its appearance is already present in the reference.
+
 ## Compatibility and limitations
 
 - Supports ordinary MOSS-Image generation. MOSS-Edit reference images and cached

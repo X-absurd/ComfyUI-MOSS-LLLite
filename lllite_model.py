@@ -56,9 +56,17 @@ def config_from_metadata(metadata):
     return config
 
 
+def control_autocast(tensor):
+    # The CUDA trainer uses AMP: GroupNorm/LayerNorm keep FP32 activations.
+    if tensor.device.type == 'cuda' and tensor.dtype in (torch.float16, torch.bfloat16):
+        return torch.autocast('cuda', dtype=tensor.dtype)
+    return nullcontext()
+
+
 def apply_image_control(module, tokens, condition, strength):
     count = condition.shape[1]
-    image = module(tokens[:, :count], condition, strength)
+    with control_autocast(tokens):
+        image = module(tokens[:, :count], condition, strength)
     return torch.cat((image, tokens[:, count:]), dim=1)
 
 
